@@ -234,6 +234,10 @@ covered_by: _VFunc_Nin2_Nout1[Literal["covered_by"], bool, bool]
 
 # spatial index
 
+_IndexPredicate = Literal[
+    "intersects", "within", "contains", "covers", "covered_by", "touches", "equals"
+]
+
 class SpatialIndex:
     def __init__(self, geographies: Iterable[Geography]) -> None: ...
     def __len__(self) -> int: ...
@@ -241,11 +245,11 @@ class SpatialIndex:
     def geometries(self) -> T_NDArray_Geography: ...
     @overload
     def query(
-        self, geography: Geography, predicate: str | None = None
+        self, geography: Geography, predicate: _IndexPredicate | None = None
     ) -> npt.NDArray[np.intp]: ...
     @overload
     def query(
-        self, geography: Iterable[Geography], predicate: str | None = None
+        self, geography: Iterable[Geography], predicate: _IndexPredicate | None = None
     ) -> npt.NDArray[np.intp]: ...
 
 # boolean operations

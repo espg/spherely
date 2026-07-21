@@ -77,12 +77,14 @@ set(CPP_SOURCES
   src/geography.cpp
   src/io.cpp
   src/predicates.cpp
-  src/predicates_common.cpp
-  src/spatial_index.cpp
   src/spherely.cpp)
 
 if(${s2geography_VERSION} VERSION_GREATER_EQUAL "0.2.0")
-    set(CPP_SOURCES ${CPP_SOURCES} src/geoarrow.cpp src/projections.cpp)
+    set(CPP_SOURCES ${CPP_SOURCES}
+      src/geoarrow.cpp
+      src/predicates_common.cpp
+      src/projections.cpp
+      src/spatial_index.cpp)
 endif()
 
 add_library(spherely MODULE ${CPP_SOURCES})
