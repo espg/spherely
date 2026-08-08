@@ -50,6 +50,153 @@ def test_spatial_index_copies_input_array() -> None:
     assert spherely.equals(tree.geometries[0], spherely.create_point(0, 0))
 
 
+def test_is_built(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    assert tree.is_built is False
+    tree.build()
+    assert tree.is_built is True
+
+
+def test_is_built_after_query(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    assert tree.is_built is False
+    # the first query builds the index
+    tree.query(spherely.create_point(1, 1))
+    assert tree.is_built is True
+
+
+def test_build_is_idempotent(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    assert not tree.is_built
+    tree.build()
+    assert tree.is_built
+    tree.build()
+    # a budget override on an already-built index is accepted and ignored
+    tree.build(tmp_memory_budget=1)
+    assert tree.is_built
+
+    poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
+    np.testing.assert_array_equal(tree.query(poly), [0, 1, 2])
+
+
+def test_build_after_query(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    point = spherely.create_point(1, 1)
+    expected = tree.query(point, predicate="intersects")
+    # the query already built the index; building again changes nothing
+    assert tree.is_built
+    tree.build()
+    assert tree.is_built
+    np.testing.assert_array_equal(tree.query(point, predicate="intersects"), expected)
+
+
+def test_build_does_not_change_results(geographies: npt.NDArray[Any]) -> None:
+    poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
+
+    lazy = spherely.SpatialIndex(geographies)
+    eager = spherely.SpatialIndex(geographies)
+    eager.build()
+    assert eager.is_built
+    assert not lazy.is_built
+
+    np.testing.assert_array_equal(eager.query(poly), lazy.query(poly))
+    np.testing.assert_array_equal(
+        eager.query(poly, predicate="contains"), lazy.query(poly, predicate="contains")
+    )
+
+
+# the s2 default and two raised budgets -- raising is the only useful
+# direction, see the SpatialIndex.build docstring
+@pytest.mark.parametrize("budget", [104_857_600, 1024**3, 4 * 1024**3])
+def test_build_budget_does_not_change_results(
+    geographies: npt.NDArray[Any], budget: int
+) -> None:
+    poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
+
+    default = spherely.SpatialIndex(geographies)
+    default.build()
+    tuned = spherely.SpatialIndex(geographies)
+    tuned.build(tmp_memory_budget=budget)
+    assert tuned.is_built
+
+    np.testing.assert_array_equal(tuned.query(poly), default.query(poly))
+    np.testing.assert_array_equal(
+        tuned.query(poly, predicate="contains"),
+        default.query(poly, predicate="contains"),
+    )
+
+
+def test_build_budget_below_default_is_legal(geographies: npt.NDArray[Any]) -> None:
+    # a budget far below the default is accepted and still correct; it only
+    # makes the build slower (more batches), so it is not a value to copy
+    poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
+
+    default = spherely.SpatialIndex(geographies)
+    default.build()
+    tiny = spherely.SpatialIndex(geographies)
+    tiny.build(tmp_memory_budget=1)
+    assert tiny.is_built
+
+    np.testing.assert_array_equal(tiny.query(poly), default.query(poly))
+
+
+@pytest.mark.parametrize("budget", [0, -1, -(1024**3)])
+def test_build_invalid_budget(geographies: npt.NDArray[Any], budget: int) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    with pytest.raises(ValueError, match="positive"):
+        tree.build(tmp_memory_budget=budget)
+    assert not tree.is_built
+
+    # the failed call left the index buildable
+    tree.build()
+    assert tree.is_built
+    np.testing.assert_array_equal(
+        tree.query(spherely.create_point(1, 1), predicate="intersects"), [1]
+    )
+
+    # the budget is validated before the "already built" early return, so an
+    # invalid value is rejected even when there is nothing left to build
+    with pytest.raises(ValueError, match="positive"):
+        tree.build(tmp_memory_budget=budget)
+
+
+def test_build_budget_out_of_range(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    # the budget is a C int64; anything larger is rejected by the binding
+    with pytest.raises(TypeError):
+        tree.build(tmp_memory_budget=2**63)
+    assert not tree.is_built
+
+
+def test_build_budget_is_restored(geographies: npt.NDArray[Any]) -> None:
+    # the override is scoped to a single build: the process-wide s2 setting is
+    # back to its previous value once the call returns
+    before = spherely._s2_tmp_memory_budget()
+
+    tuned = spherely.SpatialIndex(geographies)
+    # deliberately different from the budget in effect, so that a failure to
+    # put the previous value back is visible here
+    tuned.build(tmp_memory_budget=before + 4096)
+    assert spherely._s2_tmp_memory_budget() == before
+
+    # ...so an index built afterwards without one behaves exactly as if the
+    # override had never happened
+    poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
+    plain = spherely.SpatialIndex(geographies)
+    plain.build()
+    assert spherely._s2_tmp_memory_budget() == before
+    np.testing.assert_array_equal(plain.query(poly), tuned.query(poly))
+
+
+def test_build_empty_index() -> None:
+    tree = spherely.SpatialIndex([])
+    # nothing was queued, so there is nothing to build
+    assert tree.is_built
+    tree.build(tmp_memory_budget=1024)
+    assert len(tree) == 0
+    np.testing.assert_array_equal(tree.query(spherely.create_point(0, 0)), [])
+
+
 def test_query_scalar(geographies: npt.NDArray[Any]) -> None:
     tree = spherely.SpatialIndex(geographies)
     poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
