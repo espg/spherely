@@ -1,5 +1,6 @@
+#include <absl/flags/commandlineflag.h>
+#include <absl/flags/reflection.h>
 #include <pybind11/stl.h>
-#include <s2/base/commandlineflags.h>
 #include <s2/mutable_s2shape_index.h>
 #include <s2/s2cell_id.h>
 #include <s2/s2cell_union.h>
@@ -25,34 +26,52 @@ using namespace spherely;
 
 namespace {
 
+constexpr const char* kTmpMemoryBudgetFlag = "s2shape_index_tmp_memory_budget";
+
 /*
-** Sets s2geometry's index-build temporary memory budget
-** (``FLAGS_s2shape_index_tmp_memory_budget``, declared in
-** s2/mutable_s2shape_index.h) for the lifetime of the guard and puts the
-** previous value back on destruction, including when the build throws.
+** Sets s2geometry's process-wide index-build temporary memory budget for the
+** lifetime of the guard and puts the previous value back on destruction,
+** including when the build throws, so an override cannot leak out of the build
+** it was requested for.
 **
-** The flag is process-wide, so the guard exists to keep the override from
-** leaking out of the single build it was requested for. It is read and written
-** with absl::GetFlag / absl::SetFlag; s2/base/commandlineflags.h is included
-** for those (it pulls in <absl/flags/flag.h>) so that the absl flags
-** dependency is expressed through s2's own header, the way s2 does it.
+** The flag is reached by name through absl's reflection API rather than as
+** ``FLAGS_s2shape_index_tmp_memory_budget``: ABSL_DECLARE_FLAG expands to a
+** plain ``extern`` with no ``dllimport``, so taking that data symbol's address
+** does not link against a shared s2 on Windows. The cost is that the value
+** round-trips through a string and the parse can fail; a lookup that finds no
+** such flag skips the override.
 */
 class TmpMemoryBudgetGuard {
 public:
     explicit TmpMemoryBudgetGuard(std::int64_t bytes)
-        : m_previous(absl::GetFlag(FLAGS_s2shape_index_tmp_memory_budget)) {
-        absl::SetFlag(&FLAGS_s2shape_index_tmp_memory_budget, bytes);
+        : m_flag(absl::FindCommandLineFlag(kTmpMemoryBudgetFlag)) {
+        if (m_flag == nullptr) {
+            return;
+        }
+        m_previous = m_flag->CurrentValue();
+        std::string error;
+        if (!m_flag->ParseFrom(std::to_string(bytes), &error)) {
+            m_flag = nullptr;  // nothing was changed, so nothing to restore
+            throw py::value_error("could not set tmp_memory_budget: " + error);
+        }
     }
 
     ~TmpMemoryBudgetGuard() {
-        absl::SetFlag(&FLAGS_s2shape_index_tmp_memory_budget, m_previous);
+        if (m_flag == nullptr) {
+            return;
+        }
+        // a destructor cannot report a failed restore, and the value it is
+        // putting back came from the flag itself, so swallow the result
+        std::string error;
+        m_flag->ParseFrom(m_previous, &error);
     }
 
     TmpMemoryBudgetGuard(const TmpMemoryBudgetGuard&) = delete;
     TmpMemoryBudgetGuard& operator=(const TmpMemoryBudgetGuard&) = delete;
 
 private:
-    std::int64_t m_previous;
+    absl::CommandLineFlag* m_flag;
+    std::string m_previous;
 };
 
 }  // namespace
@@ -86,8 +105,7 @@ public:
         return static_cast<std::size_t>(m_geographies.size());
     }
 
-    // True once the queued updates have been applied, i.e. the index can be
-    // queried without doing any build work.
+    // True once the queued updates have been applied (no build work pending).
     bool is_built() const {
         return m_index->ShapeIndex().is_fresh();
     }
@@ -101,8 +119,7 @@ public:
                                   " (s2geometry's default budget is 104857600 bytes)");
         }
 
-        // nothing is pending, so there is no build to tune: return without
-        // touching the process-wide budget flag
+        // nothing pending: no build to tune, so leave the process-wide flag alone
         if (is_built()) {
             return;
         }
@@ -225,9 +242,8 @@ void init_spatial_index(py::module& m) {
         shapely's ``STRtree``.
 
         The underlying shape index is built lazily: the constructor only queues
-        the geographies, and the first query pays for the build. Use
-        :py:meth:`SpatialIndex.build` to do that work up front, and to tune it
-        for large collections.
+        the geographies and the first query pays for the build. Use
+        :py:meth:`SpatialIndex.build` to do that work up front instead.
 
         Parameters
         ----------
@@ -247,60 +263,34 @@ void init_spatial_index(py::module& m) {
         Force the deferred index build, optionally under a raised temporary
         memory budget.
 
-        The index is built lazily, so the constructor is cheap and the first
-        query pays the whole build cost. This method makes that cost explicit
-        (and keeps it out of the timing of the first query), and lets it be
-        tuned for large collections.
-
-        s2geometry builds the index in batches sized to fit a temporary memory
-        budget of 104857600 bytes (100 MB) by default, and each batch
-        re-absorbs the cells built so far. Many batches therefore cost
-        noticeably more than one, and collections of millions of edges can
-        spend minutes in the first query. Raising the budget so that the index
-        is built in fewer (ideally one) batches makes the build close to linear
-        in the number of edges.
+        The index is built lazily, so without this call the first query pays
+        the whole build cost. Calling it is optional, never changes query
+        results, and does nothing once the index is built (see
+        :py:attr:`SpatialIndex.is_built`).
 
         Parameters
         ----------
         tmp_memory_budget : int, optional
-            Temporary memory budget for this build, **in bytes** -- the unit of
-            the underlying s2geometry setting
-            (``FLAGS_s2shape_index_tmp_memory_budget``, default 104857600, i.e.
-            100 MB). Must be strictly positive, and must fit in a signed 64-bit
-            integer (larger values raise ``TypeError``). The previous value is
-            put back when the call returns, so the override does not leak into
-            any later build. ``None`` does *not* mean "no budget": it leaves
-            s2geometry's setting untouched (100 MB unless something else in the
-            process changed it), so the build still batches and costs what the
-            first query would have. Pass a raised value to avoid that.
+            Temporary memory budget for this build, in bytes. s2geometry builds
+            the index in batches sized to fit it, and many batches cost more
+            than one, so the knob is only useful *raised*; about 140 bytes per
+            edge is enough to build in a single batch. Must be strictly
+            positive, and must fit in a signed 64-bit integer (larger values
+            raise ``TypeError``). The previous value is put back when the call
+            returns, so the override does not leak into any later build.
 
-            This knob is only useful *raised*. A budget below the one in effect
-            splits the build into more batches and makes it slower -- 1 MB
-            measured about ten times slower than the default on a 634k-edge
-            collection. Mind the unit: ``tmp_memory_budget=100`` is 100
-            *bytes*, not 100 MB, and is accepted.
+            ``None`` does *not* mean "no budget": it leaves s2geometry's
+            setting untouched (104857600 bytes, i.e. 100 MB, unless something
+            else in the process changed it), so the build still batches.
 
         Notes
         -----
-        Memory: the budget is a licence to hold that much scratch at once, so
-        peak resident memory can rise by roughly the amount granted. s2geometry
-        needs on the order of 140 bytes of temporary memory per edge, so
-        ``n_edges * 140`` is a reasonable budget for building in a single
-        batch. Nothing is granted unless a budget is passed, so the extra
-        memory is always opt-in.
+        Peak resident memory can rise by roughly the budget granted, and
+        nothing is granted unless a budget is passed.
 
-        Calling this method is optional and never changes query results. It is
-        idempotent: a second call, or a call after the index has already been
-        built by a query, does nothing (and leaves the budget untouched). See
-        :py:attr:`SpatialIndex.is_built`.
-
-        Threads: this call holds the GIL for its whole duration, so no other
-        Python thread runs until the build finishes -- minutes, for a large
-        collection. That is not a regression (a first query does the same build
-        under the same GIL), but it is worth knowing before calling it from a
-        thread. The budget is a process-wide s2geometry setting for the
-        duration of the call, so an index being built concurrently in a
-        non-Python thread would see the override too.
+        This call holds the GIL for its whole duration -- minutes, for a large
+        collection -- and the budget is a process-wide s2geometry setting for
+        that duration.
 
         Examples
         --------
@@ -316,8 +306,7 @@ void init_spatial_index(py::module& m) {
 
         ``False`` between the constructor and the first
         :py:meth:`SpatialIndex.build` or query, ``True`` afterwards. An index
-        over an empty collection has nothing to queue and is ``True`` from the
-        start.
+        over an empty collection is ``True`` from the start.
 
     )pbdoc")
         .def_property_readonly("geometries",
@@ -363,6 +352,12 @@ void init_spatial_index(py::module& m) {
     // SpatialIndex.build() puts the process-wide budget back.
     m.def(
         "_s2_tmp_memory_budget",
-        []() { return absl::GetFlag(FLAGS_s2shape_index_tmp_memory_budget); },
+        []() -> std::int64_t {
+            const auto* flag = absl::FindCommandLineFlag(kTmpMemoryBudgetFlag);
+            if (flag == nullptr) {
+                throw py::value_error(std::string("no such s2 flag: ") + kTmpMemoryBudgetFlag);
+            }
+            return std::stoll(flag->CurrentValue());
+        },
         "Return s2geometry's current index-build temporary memory budget, in bytes.");
 }
