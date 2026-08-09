@@ -37,6 +37,14 @@ using namespace spherely;
 
 namespace {
 
+// s2 0.11 declares Decoder::get_varint64(uint64*) -- `unsigned long long` -- while
+// 0.14 declares get_varint64(uint64_t*), which on LP64 is `unsigned long`. The two
+// are distinct types, so a pointer to the wrong one will not convert. Deduce
+// whichever this build's s2 wants rather than naming either.
+template <typename T>
+T varint64_value_type(bool (Decoder::*)(T*));
+using VarintU64 = decltype(varint64_value_type(&Decoder::get_varint64));
+
 /*
 ** Sets s2geometry's process-wide index-build temporary memory budget
 ** (``FLAGS_s2shape_index_tmp_memory_budget``) for the lifetime of the guard and
@@ -304,8 +312,8 @@ public:
         }
         self->m_has_geographies = (flags & kFlagHasGeographies) != 0;
 
-        std::uint64_t num_geographies;
-        std::uint64_t num_shapes;
+        VarintU64 num_geographies;
+        VarintU64 num_shapes;
         if (!decoder.get_varint64(&num_geographies) || !decoder.get_varint64(&num_shapes)) {
             fail();
         }
@@ -330,7 +338,7 @@ public:
         self->m_num_geographies = static_cast<py::ssize_t>(num_geographies);
         self->m_values.reserve(num_shapes);
         for (std::uint64_t i = 0; i < num_shapes; i++) {
-            std::uint64_t value;
+            VarintU64 value;
             if (!decoder.get_varint64(&value) || value >= num_geographies) {
                 fail();
             }

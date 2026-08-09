@@ -879,7 +879,14 @@ def test_from_encoded_bytes_like() -> None:
     )
     encoded = tree.encode()
     query = spherely.create_point(0.9, 0.9)
-    for buffer in [encoded, bytearray(encoded), memoryview(encoded)]:
+    # annotated: an unannotated literal joins to Sequence[int], which
+    # from_encoded does not accept
+    buffers: list[bytes | bytearray | memoryview] = [
+        encoded,
+        bytearray(encoded),
+        memoryview(encoded),
+    ]
+    for buffer in buffers:
         decoded = spherely.SpatialIndex.from_encoded(buffer)
         np.testing.assert_array_equal(decoded.query_nearest(query), [1])
 
