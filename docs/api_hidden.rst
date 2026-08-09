@@ -9,6 +9,7 @@
    SpatialIndex
    SpatialIndex.build
    SpatialIndex.encode
+   SpatialIndex.from_encoded
    SpatialIndex.geometries
    SpatialIndex.is_built
    SpatialIndex.query

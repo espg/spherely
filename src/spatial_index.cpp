@@ -1,4 +1,5 @@
 #include <pybind11/stl.h>
+#include <s2/encoded_s2shape_index.h>
 #include <s2/mutable_s2shape_index.h>
 #include <s2/s1angle.h>
 #include <s2/s1chord_angle.h>
@@ -6,6 +7,7 @@
 #include <s2/s2cell_union.h>
 #include <s2/s2closest_edge_query.h>
 #include <s2/s2region_coverer.h>
+#include <s2/s2shape_index.h>
 #include <s2/s2shapeutil_coding.h>
 #include <s2/util/coding/coder.h>
 #include <s2geography.h>
@@ -20,6 +22,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "constants.hpp"
@@ -88,12 +91,26 @@ public:
         }
     }
 
+    // in encoded mode the EncodedS2ShapeIndex points into ``m_encoded``,
+    // whose buffer may live inside the string object itself (small string
+    // optimization): moving or copying the index would leave it dangling
+    SpatialIndex(SpatialIndex&&) = delete;
+    SpatialIndex& operator=(SpatialIndex&&) = delete;
+
     std::size_t size() const {
+        if (is_encoded()) {
+            return static_cast<std::size_t>(m_num_geographies);
+        }
         return static_cast<std::size_t>(m_geographies.size());
     }
 
     // True once the queued updates have been applied (no build work pending).
+    // An index loaded from encoded bytes never has any: its cells are decoded
+    // on demand, so there is nothing to build.
     bool is_built() const {
+        if (is_encoded()) {
+            return true;
+        }
         return m_index->ShapeIndex().is_fresh();
     }
 
@@ -106,22 +123,55 @@ public:
                                   " (s2geometry's default budget is 104857600 bytes)");
         }
 
+        // an encoded index has no queued updates and no mutable shape index to
+        // build: the budget check above is all that applies to it
+        if (is_encoded()) {
+            return;
+        }
+
         // nothing pending: no build to tune, so leave the process-wide flag alone
         if (is_built()) {
             return;
         }
 
-        const auto& shape_index = m_index->ShapeIndex();
+        const auto& index = m_index->ShapeIndex();
         if (tmp_memory_budget.has_value()) {
             TmpMemoryBudgetGuard guard(*tmp_memory_budget);
-            shape_index.ForceBuild();
+            index.ForceBuild();
         } else {
-            shape_index.ForceBuild();
+            index.ForceBuild();
         }
     }
 
+    // Number of tree entries whose Geography has been reconstructed from the
+    // encoded blob so far (always 0 for a built index). Exposed as the
+    // ``_decoded_count`` property so that tests can pin the laziness
+    // contract deterministically.
+    std::size_t decoded_count() const {
+        return m_decoded_count;
+    }
+
     py::array geometries() const {
-        return m_geographies;
+        check_has_geographies("geometries");
+        if (!is_encoded()) {
+            return m_geographies;
+        }
+        // reconstruct every remaining entry (insertion order is the tree
+        // order) and cache the resulting array
+        if (!m_decoded_geometries) {
+            auto result = py::array_t<PyObjectGeography>(m_num_geographies);
+            py::buffer_info buf = result.request();
+            py::object* data = static_cast<py::object*>(buf.ptr);
+            for (py::ssize_t i = 0; i < m_num_geographies; i++) {
+                decoded_geog(i);
+                data[i] = m_decoded_slots[static_cast<std::size_t>(i)];
+            }
+            m_decoded_geometries = std::move(result);
+        }
+        // m_decoded_geometries is stored as a py::object, so borrow a new
+        // reference to it as a py::array rather than downcasting the
+        // reference itself
+        return py::reinterpret_borrow<py::array>(m_decoded_geometries);
     }
 
     // Serialize the index to bytes: a small header, the shape id -> tree
@@ -129,13 +179,33 @@ public:
     // width offset/length table followed by one block per tree entry) or a
     // compact S2 shape stream, and finally the index structure.
     //
-    // The shape data is stored once either way: with the geographies included
-    // the blocks hold it and no separate shape stream is written.
+    // The shape data is stored once either way. Without the geographies the
+    // stream written by CompactEncodeTaggedShapes backs the decoded index
+    // directly (via LazyDecodeShapeFactory, which decodes each shape on
+    // first access only). With the geographies there is no separate shape
+    // stream: the decoded index pulls shape k out of the reconstruction of
+    // the geography that owns it (see materialize_shape), which defers all
+    // shape data to first touch but makes that touch reconstruct the whole
+    // owning geography.
     //
     // Everything past the header is s2geometry's / s2geography's own
     // encoding, so the format is tied to the library versions spherely is
     // built against (only the header is versioned here).
     py::bytes encode(bool include_geographies) const {
+        if (is_encoded()) {
+            // the original blob is all this index has: hand it back when it
+            // matches the request rather than fabricating the other flavor
+            if (include_geographies != m_has_geographies) {
+                throw py::value_error(
+                    m_has_geographies
+                        ? "encode(include_geographies=False) is not supported for an index "
+                          "loaded from encoded bytes that include the geographies"
+                        : "encode(include_geographies=True) is not supported for an index "
+                          "loaded from bytes encoded with include_geographies=False");
+            }
+            return py::bytes(m_encoded);
+        }
+
         // gather the wrapped geographies under the GIL; their S2 data is
         // owned by the Python objects this index keeps alive
         std::vector<const Geography*> geogs;
@@ -174,6 +244,8 @@ public:
             }
 
             if (include_geographies) {
+                // single copy of the shape data: the geography blocks stand
+                // in for the shape stream (see materialize_shape)
                 encode_geography_blocks(encoder, geogs);
             } else {
                 s2shapeutil::CompactEncodeTaggedShapes(index, &encoder);
@@ -181,6 +253,120 @@ public:
             index.Encode(&encoder);
         }
         return py::bytes(encoder.base(), encoder.length());
+    }
+
+    // Load an index serialized with ``encode()``, wrapping the bytes in a
+    // lazy EncodedS2ShapeIndex: opening is near-instant and index cells /
+    // shapes are only decoded when queries touch them.
+    static std::unique_ptr<SpatialIndex> from_encoded(const py::buffer& encoded) {
+        // any contiguous bytes-like object (bytes, bytearray, memoryview...);
+        // the bytes are copied, so the buffer is not kept alive afterwards
+        py::buffer_info info = encoded.request();
+        if (info.ndim != 1 || info.itemsize != 1 || info.strides[0] != 1) {
+            throw py::type_error("encoded must be a contiguous bytes-like object");
+        }
+
+        auto self = std::unique_ptr<SpatialIndex>(new SpatialIndex());
+        self->m_encoded.assign(static_cast<const char*>(info.ptr),
+                               static_cast<std::size_t>(info.size));
+
+        Decoder decoder(self->m_encoded.data(), self->m_encoded.size());
+        auto fail = []() {
+            throw py::value_error("invalid encoded SpatialIndex");
+        };
+        if (decoder.avail() < kHeaderBytes || decoder.get32() != kEncodingMagic) {
+            fail();
+        }
+        if (decoder.get8() != kEncodingVersion) {
+            throw py::value_error("unsupported encoded SpatialIndex version");
+        }
+        auto flags = decoder.get8();
+        if ((flags & ~kFlagHasGeographies) != 0) {
+            throw py::value_error("unsupported encoded SpatialIndex flags");
+        }
+        self->m_has_geographies = (flags & kFlagHasGeographies) != 0;
+
+        std::uint64_t num_geographies;
+        std::uint64_t num_shapes;
+        if (!decoder.get_varint64(&num_geographies) || !decoder.get_varint64(&num_shapes)) {
+            fail();
+        }
+        // both counts come straight from the (untrusted) input: reject values
+        // that cannot describe this buffer before allocating anything. Tree
+        // indices and shape ids are both stored as int (as in the built index),
+        // and every encoded value takes at least one byte.
+        constexpr auto kMaxInt = static_cast<std::uint64_t>(std::numeric_limits<int>::max());
+        if (num_geographies > kMaxInt || num_shapes > kMaxInt || num_shapes > decoder.avail()) {
+            fail();
+        }
+        // a fat blob spends at least one block table entry plus one (minimal)
+        // block per geography: a count that cannot fit in what is left of the
+        // buffer is rejected here, before the per-geography vectors are sized
+        // on it. Without this a 12 byte blob claiming 2^31-1 geographies asks
+        // for tens of gigabytes before ``init_geography_blocks`` ever looks at
+        // ``avail()``.
+        if (self->m_has_geographies &&
+            num_geographies > decoder.avail() / (kBlockTableEntryBytes + kBlockMinBytes)) {
+            fail();
+        }
+        self->m_num_geographies = static_cast<py::ssize_t>(num_geographies);
+        self->m_values.reserve(num_shapes);
+        for (std::uint64_t i = 0; i < num_shapes; i++) {
+            std::uint64_t value;
+            if (!decoder.get_varint64(&value) || value >= num_geographies) {
+                fail();
+            }
+            self->m_values.push_back(static_cast<int>(value));
+        }
+
+        if (self->m_has_geographies) {
+            self->m_shape_counts.assign(static_cast<std::size_t>(num_geographies), 0);
+            self->m_first_shape.assign(static_cast<std::size_t>(num_geographies), -1);
+            int previous = -1;
+            for (std::size_t shape_id = 0; shape_id < self->m_values.size(); shape_id++) {
+                int value = self->m_values[shape_id];
+                // materialize_shape addresses shape k as (tree entry, k -
+                // first shape of the entry), which requires each entry's
+                // shapes to form one contiguous ascending run, as written by
+                // encode: a non-monotonic value table cannot come from it
+                if (value < previous) {
+                    fail();
+                }
+                if (value > previous) {
+                    self->m_first_shape[static_cast<std::size_t>(value)] =
+                        static_cast<int>(shape_id);
+                }
+                self->m_shape_counts[static_cast<std::size_t>(value)]++;
+                previous = value;
+            }
+            self->m_decoded_slots.resize(static_cast<std::size_t>(num_geographies));
+            if (!self->init_geography_blocks(decoder, num_geographies)) {
+                fail();
+            }
+        }
+
+        self->m_encoded_index = std::make_unique<EncodedS2ShapeIndex>();
+        // a fat blob carries no shape stream of its own: the index pulls
+        // shapes out of the geography blocks on demand. A thin blob's shapes
+        // are decoded lazily from its compact shape stream.
+        bool init_ok =
+            self->m_has_geographies
+                ? self->m_encoded_index->Init(&decoder, GeographyBlockShapeFactory(self.get()))
+                : self->m_encoded_index->Init(&decoder,
+                                              s2shapeutil::LazyDecodeShapeFactory(&decoder));
+        if (!init_ok) {
+            fail();
+        }
+        // the value table is indexed by shape id: a table that does not cover
+        // every decoded shape would be read out of bounds by queries
+        if (self->m_values.size() !=
+            static_cast<std::size_t>(self->m_encoded_index->num_shape_ids())) {
+            fail();
+        }
+        if (self->m_has_geographies && !self->check_index_shape_ids()) {
+            fail();
+        }
+        return self;
     }
 
     // Scalar query: single Geography -> 1-d array of sorted tree indices.
@@ -256,6 +442,11 @@ public:
                 "query geography must be a Geography or a 1-dimensional array of Geography");
         }
 
+        // checked up front (as the predicate is in the array ``query``) so
+        // that an empty input array raises too rather than silently returning
+        if (exclusive) {
+            check_has_geographies("query_nearest with exclusive=True");
+        }
         auto max_dist = to_chord_angle(max_distance, radius);
         auto n = geographies.size();
         auto* data = static_cast<PyObjectGeography*>(geographies.request().ptr);
@@ -302,10 +493,48 @@ private:
     // one fixed-width (offset, length) pair per geography, so that block j is
     // addressable without scanning the section
     static constexpr std::size_t kBlockTableEntryBytes = 2 * sizeof(std::uint64_t);
+    // a block holds at least the geography type and empty bytes plus the
+    // 4-byte tag written by s2geography::Geography::EncodeTagged
+    static constexpr std::uint64_t kBlockMinBytes = 2 + 4;
 
-    std::unique_ptr<s2geog::GeographyIndex> m_index;
-    // also keeps the Geography objects alive (the index borrows their S2Shapes)
+    // Both indexes below borrow from the members declared above them and are
+    // therefore declared last, so that they are destroyed first: members are
+    // destroyed in reverse declaration order, and an S2ShapeIndex touches its
+    // shapes while being torn down.
+
+    // built mode (constructed from an array of geographies)
+    // m_geographies keeps the Geography objects alive (the index borrows
+    // their S2Shapes)
     py::array_t<PyObjectGeography> m_geographies;
+    std::unique_ptr<s2geog::GeographyIndex> m_index;
+
+    // encoded mode (loaded with from_encoded); the encoded bytes are kept
+    // alive here as EncodedS2ShapeIndex works directly on them
+    std::string m_encoded;
+    std::vector<int> m_values;
+    py::ssize_t m_num_geographies = 0;
+    // whether the blob carries per-geography blocks, and where each block
+    // lives inside ``m_encoded`` (absolute offset, length)
+    bool m_has_geographies = false;
+    std::vector<std::pair<std::size_t, std::size_t>> m_geog_blocks;
+    // number of shapes per tree entry according to the id map (used to
+    // cross-check reconstructed geographies against the encoded index), and
+    // the first shape id of each entry's run (-1 for entries with no shape)
+    std::vector<int> m_shape_counts;
+    std::vector<int> m_first_shape;
+    // lazily reconstructed Geography objects, one slot per tree entry: a slot
+    // is filled on first touch and cached for the lifetime of the index
+    // (mutable: caching only, doesn't affect the observable query results)
+    mutable std::vector<py::object> m_decoded_slots;
+    mutable std::size_t m_decoded_count = 0;
+    // cached ``geometries`` array of the reconstructed objects
+    mutable py::object m_decoded_geometries;
+    // holds S2Shapes materialized from m_decoded_slots (fat) or decoded out
+    // of m_encoded (thin): declared after both
+    std::unique_ptr<EncodedS2ShapeIndex> m_encoded_index;
+
+    // only used internally by ``from_encoded`` (encoded mode)
+    SpatialIndex() = default;
 
     // Append the per-geography section to ``encoder``: a fixed-width
     // (offset, length) table (offsets relative to the first block, blocks
@@ -345,11 +574,310 @@ private:
         }
     }
 
-    static std::optional<PredicateFunc> make_predicate(const std::optional<std::string>& name) {
+    // Parse and validate the per-geography section (see
+    // ``encode_geography_blocks``) at the decoder's current position, filling
+    // ``m_geog_blocks``, and skip the decoder past it. Returns false on any
+    // inconsistency.
+    bool init_geography_blocks(Decoder& decoder, std::uint64_t num_geographies) {
+        // ``from_encoded`` bounds num_geographies by what is left of the
+        // buffer, so this product cannot overflow
+        auto table_bytes = static_cast<std::size_t>(kBlockTableEntryBytes * num_geographies);
+        if (decoder.avail() < table_bytes) {
+            return false;
+        }
+        auto blocks_begin = decoder.pos() + table_bytes;
+        // what is left for the blocks themselves once the table is consumed
+        auto blocks_avail = static_cast<std::uint64_t>(decoder.avail() - table_bytes);
+        m_geog_blocks.reserve(num_geographies);
+        std::uint64_t expected_offset = 0;
+        for (std::uint64_t j = 0; j < num_geographies; j++) {
+            std::uint64_t offset = decoder.get64();
+            std::uint64_t length = decoder.get64();
+            // blocks are contiguous and in order: reject gaps, overlaps and
+            // runt blocks
+            if (offset != expected_offset || length < kBlockMinBytes || length > blocks_avail) {
+                return false;
+            }
+            m_geog_blocks.emplace_back(blocks_begin + static_cast<std::size_t>(offset),
+                                       static_cast<std::size_t>(length));
+            expected_offset = offset + length;
+            // bounded on every entry rather than once after the loop: the
+            // running sum is free to wrap past 2^64 before a single check at
+            // the end ever looks at it, and each block would then have been
+            // recorded at an in-range offset with an out-of-range length
+            if (expected_offset > blocks_avail) {
+                return false;
+            }
+        }
+        decoder.skip(static_cast<std::ptrdiff_t>(expected_offset));
+        return true;
+    }
+
+    // Check that every shape id clipped by the decoded index cells is covered
+    // by the value table (fat blobs only).
+    //
+    // A thin blob carries its own shape stream, so ``num_shape_ids()`` is an
+    // independent count and the table size check in ``from_encoded`` is a real
+    // cross-check. A fat blob's index is sized from
+    // ``GeographyBlockShapeFactory::size()``, i.e. from the value table
+    // itself, so that check compares the table with itself and nothing
+    // reconciles the shape ids stored in the index cells with it. A cell
+    // clipping a shape id past the end of the table makes
+    // ``EncodedS2ShapeIndex::shape()`` index ``shapes_`` out of bounds
+    // (unchecked), which segfaults inside the distance queries.
+    //
+    // This is one linear pass over the index cells at load, of the same order
+    // as the value table and block table passes ``from_encoded`` already
+    // makes. It decodes cells but never shapes, so no geography is
+    // reconstructed here.
+    bool check_index_shape_ids() const {
+        auto num_shape_ids = static_cast<int>(m_values.size());
+        int max_shape_id = -1;
+        for (S2ShapeIndex::Iterator iter(&shape_index(), S2ShapeIndex::BEGIN); !iter.done();
+             iter.Next()) {
+            const S2ShapeIndexCell& cell = iter.cell();
+            for (int k = 0; k < cell.num_clipped(); k++) {
+                int shape_id = cell.clipped(k).shape_id();
+                if (shape_id < 0 || shape_id >= num_shape_ids) {
+                    return false;
+                }
+                max_shape_id = std::max(max_shape_id, shape_id);
+            }
+        }
+        // exact, not just in range: ``encode`` writes one value per shape of
+        // the index it serializes and every such shape is clipped into at
+        // least one cell, so a table with entries past the last shape the
+        // cells reference did not come from it (and would make
+        // ``num_shape_ids()`` -- which is this table's size for a fat blob --
+        // over-report the shapes the index actually has)
+        return max_shape_id + 1 == num_shape_ids;
+    }
+
+    bool is_encoded() const {
+        return m_encoded_index != nullptr;
+    }
+
+    // The operations that need the Geography objects work on a built index
+    // and on one decoded from a blob written with the geographies included;
+    // they raise on an index decoded from an index-only blob.
+    void check_has_geographies(const std::string& what) const {
+        if (is_encoded() && !m_has_geographies) {
+            throw py::value_error(what +
+                                  " is not supported for an index loaded from bytes encoded "
+                                  "with include_geographies=False (encode with "
+                                  "include_geographies=True to keep the Geography objects)");
+        }
+    }
+
+    // Whether a block's geography type byte can describe what its tagged
+    // encoding actually holds. ``Geography::decode`` takes the type byte at
+    // face value -- as it does when unpickling, where it comes from a trusted
+    // ``encode`` -- so nothing else reconciles the two: a relabelled block
+    // would decode into a geography whose ``get_type_id`` disagrees with the
+    // geography itself (a Polygon byte on a point block, say).
+    //
+    // A singular type and its MULTI* form share one kind, so this narrows the
+    // byte to a pair rather than to a single value: swapping the two labels
+    // stays undetectable here (it would take counting the parts, which is
+    // ``extract_geog_properties``' job and is not reachable from a decoded
+    // Geography). That is a wrong ``get_type_id`` label on a corrupt blob,
+    // with no effect on the geometry or on any query -- the same latitude
+    // unpickling a hand-made state tuple already has.
+    static bool type_matches_kind(GeographyType geog_type, s2geog::GeographyKind kind) {
+        switch (kind) {
+            case s2geog::GeographyKind::POINT:
+            case s2geog::GeographyKind::CELL_CENTER:
+                return geog_type == GeographyType::Point || geog_type == GeographyType::MultiPoint;
+            case s2geog::GeographyKind::POLYLINE:
+                return geog_type == GeographyType::LineString ||
+                       geog_type == GeographyType::MultiLineString;
+            case s2geog::GeographyKind::POLYGON:
+                return geog_type == GeographyType::Polygon ||
+                       geog_type == GeographyType::MultiPolygon;
+            case s2geog::GeographyKind::GEOGRAPHY_COLLECTION:
+                return geog_type == GeographyType::GeometryCollection;
+            default:
+                // the kinds rejected just above; GeographyType::None belongs
+                // with those, so it never matches either
+                return false;
+        }
+    }
+
+    // Reconstruct the Geography of tree entry ``j`` from its block, or return
+    // the cached reconstruction. Decoding goes through Geography::decode (the
+    // pickle path), so the objects are indistinguishable from unpickled ones.
+    //
+    // The caller must hold the GIL. The slot cache is a plain vector and the
+    // counter a plain size_t, so the cache-hit path below is only safe
+    // because every entry point reaches it with the GIL held (no query path
+    // releases it) -- the ``gil_scoped_acquire`` guard sits on the decode
+    // path and does not, and cannot, cover the slot read above it. It is
+    // there so that the Python API calls of a decode still work should a
+    // caller ever release the GIL around the C++ query work; making that
+    // caller safe would take more than moving the guard up.
+    Geography* decoded_geog(py::ssize_t i) const {
+        auto j = static_cast<std::size_t>(i);
+        py::object& slot = m_decoded_slots[j];
+        if (!slot) {
+            py::gil_scoped_acquire acquire;
+            const auto& [offset, length] = m_geog_blocks[j];
+            const char* block = m_encoded.data() + offset;
+            auto geog_type = static_cast<std::int8_t>(static_cast<unsigned char>(block[0]));
+            auto empty = static_cast<unsigned char>(block[1]);
+            if (geog_type < -1 || geog_type > 6 || empty > 1) {
+                throw py::value_error("invalid encoded SpatialIndex geography block");
+            }
+            auto encoded_geog = py::bytes(block + 2, length - 2);
+            std::unique_ptr<Geography> geog;
+            try {
+                auto tuple = py::make_tuple(geog_type, empty != 0, encoded_geog);
+                geog = std::make_unique<Geography>(Geography::decode(tuple));
+            } catch (const py::error_already_set&) {
+                throw;
+            } catch (const std::exception&) {
+                throw py::value_error("invalid encoded SpatialIndex geography block");
+            }
+            // ``encode`` only ever writes the kinds a spherely Geography can
+            // wrap: the remaining ones are not just unexpected here, they are
+            // unsound. UNINITIALIZED and SHAPE_INDEX have no WKT
+            // representation (accessors raise "Unsupported Geography
+            // subclass"), and an ENCODED_SHAPE_INDEX decodes lazily over the
+            // buffer it was handed -- the temporary string inside
+            // Geography::decode -- so it would outlive its own data.
+            switch (geog->geog().kind()) {
+                case s2geog::GeographyKind::UNINITIALIZED:
+                case s2geog::GeographyKind::SHAPE_INDEX:
+                case s2geog::GeographyKind::ENCODED_SHAPE_INDEX:
+                    throw py::value_error("invalid encoded SpatialIndex geography block");
+                default:
+                    break;
+            }
+            if (!type_matches_kind(geog->geog_type(), geog->geog().kind())) {
+                throw py::value_error("invalid encoded SpatialIndex geography block");
+            }
+            // the id map and the block must agree on the shape count, or the
+            // reconstructed geography is not the one the index was built on
+            if (geog->num_shapes() != m_shape_counts[j]) {
+                throw py::value_error("invalid encoded SpatialIndex geography block");
+            }
+            auto decoded = PyObjectGeography::from_geog(std::move(geog));
+            // everything between the ``!slot`` test and here runs
+            // Python-visible work (py::bytes, Geography::decode, from_geog),
+            // any of which can trigger a collection whose __del__ re-enters
+            // this index and fills the same slot. The index may already have
+            // cached an S2Shape borrowing that inner object, so overwriting
+            // the slot would leave the cached shape pointing at a dropped
+            // geography: keep the entry that got there first.
+            if (!slot) {
+                slot = std::move(decoded);
+                m_decoded_count++;
+            }
+        }
+        return static_cast<PyObjectGeography&>(slot).as_geog_ptr();
+    }
+
+    // Geography of tree entry ``i``: from the built array, or lazily
+    // reconstructed from its encoded block. Predicate refinement and equality
+    // run on these objects through the same code paths either way.
+    Geography* candidate_geog(py::ssize_t i) const {
+        if (is_encoded()) {
+            return decoded_geog(i);
+        }
+        auto* data = static_cast<PyObjectGeography*>(m_geographies.request().ptr);
+        return data[i].as_geog_ptr();
+    }
+
+    // Produce shape ``shape_id`` of a fat blob's index by reconstructing (or
+    // reusing) the geography that owns it. The returned shape borrows the
+    // geography's data, which stays alive in the slot cache for the lifetime
+    // of this index. Called from GeographyBlockShapeFactory inside query
+    // execution, always with the GIL held (see decoded_geog).
+    std::unique_ptr<S2Shape> materialize_shape(int shape_id) const {
+        auto j = m_values.at(static_cast<std::size_t>(shape_id));
+        Geography* geog = decoded_geog(j);
+        // decoded_geog checked the block against the id map's shape count,
+        // so the run arithmetic below cannot leave the geography's range
+        int sub = shape_id - m_first_shape[static_cast<std::size_t>(j)];
+        return geog->geog().Shape(sub);
+    }
+
+    // ShapeFactory backing the EncodedS2ShapeIndex of a fat blob: there is
+    // no second copy of the shape data in the blob, shapes are pulled from
+    // the per-geography blocks instead. The owner pointer is stable
+    // (SpatialIndex is immovable) and outlives the encoded index holding the
+    // cloned factory, which is declared last among the members precisely so
+    // that it is torn down before everything it borrows.
+    class GeographyBlockShapeFactory : public S2ShapeIndex::ShapeFactory {
+    public:
+        explicit GeographyBlockShapeFactory(const SpatialIndex* owner) : m_owner(owner) {}
+
+        int size() const override {
+            return static_cast<int>(m_owner->m_values.size());
+        }
+
+        std::unique_ptr<S2Shape> operator[](int shape_id) const override {
+            return m_owner->materialize_shape(shape_id);
+        }
+
+        std::unique_ptr<ShapeFactory> Clone() const override {
+            return std::make_unique<GeographyBlockShapeFactory>(*this);
+        }
+
+    private:
+        const SpatialIndex* m_owner;
+    };
+
+    const S2ShapeIndex& shape_index() const {
+        if (is_encoded()) {
+            return *m_encoded_index;
+        }
+        return m_index->ShapeIndex();
+    }
+
+    // tree index of the geography that owns the given shape
+    int tree_value(int shape_id) const {
+        if (is_encoded()) {
+            // ``from_encoded`` checks the table covers every shape id; ``at``
+            // keeps a mismatch a Python exception rather than a bad read
+            return m_values.at(static_cast<std::size_t>(shape_id));
+        }
+        return m_index->value(shape_id);
+    }
+
+    std::optional<PredicateFunc> make_predicate(const std::optional<std::string>& name) const {
         if (!name.has_value()) {
             return std::nullopt;
         }
+        check_has_geographies("query with a predicate");
         return get_predicate(*name);
+    }
+
+    // Collect the tree indices of the shapes in the index cells overlapping
+    // ``cell_id`` (mirrors s2geography::GeographyIndex::Iterator::Query,
+    // which is bound to the mutable index of the built mode).
+    void query_cell(S2ShapeIndex::Iterator& iter,
+                    const S2CellId& cell_id,
+                    std::unordered_set<int>& hits) const {
+        auto add_cell_shapes = [&]() {
+            const S2ShapeIndexCell& index_cell = iter.cell();
+            for (int k = 0; k < index_cell.num_clipped(); k++) {
+                hits.insert(tree_value(index_cell.clipped(k).shape_id()));
+            }
+        };
+
+        S2CellRelation relation = iter.Locate(cell_id);
+        if (relation == S2CellRelation::INDEXED) {
+            // the index has this cell (or an ancestor of it)
+            add_cell_shapes();
+        } else if (relation == S2CellRelation::SUBDIVIDED) {
+            // the index has child cells of ``cell_id`` (the iterator is
+            // positioned at the first one): visit them all
+            while (!iter.done() && cell_id.contains(iter.id())) {
+                add_cell_shapes();
+                iter.Next();
+            }
+        }
+        // else: DISJOINT (do nothing)
     }
 
     // Return the sorted tree indices whose cells overlap the query geography,
@@ -362,17 +890,18 @@ private:
         std::vector<S2CellId> covering;
         coverer.GetCovering(*region, &covering);
 
-        s2geog::GeographyIndex::Iterator iter(m_index.get());
-        iter.Query(covering, &hits);
+        S2ShapeIndex::Iterator iter(&shape_index());
+        for (const S2CellId& cell_id : covering) {
+            query_cell(iter, cell_id, hits);
+        }
 
         std::vector<int> results;
         if (pred == nullptr) {
             results.assign(hits.begin(), hits.end());
         } else {
             const auto& query_index = query_geog.geog_index();
-            auto* data = static_cast<PyObjectGeography*>(m_geographies.request().ptr);
             for (int candidate : hits) {
-                auto* cand_geog = data[candidate].as_geog_ptr();
+                auto* cand_geog = candidate_geog(candidate);
                 if ((*pred)(query_index, cand_geog->geog_index())) {
                     results.push_back(candidate);
                 }
@@ -422,7 +951,7 @@ private:
         std::unordered_set<int> hits;
         for (const auto& result : query.FindClosestEdges(&target)) {
             if (result.distance() == dist) {
-                hits.insert(m_index->value(result.shape_id()));
+                hits.insert(tree_value(result.shape_id()));
             }
         }
         std::vector<int> results(hits.begin(), hits.end());
@@ -456,11 +985,14 @@ private:
                                        bool all_matches,
                                        S1ChordAngle* distance) const {
         *distance = S1ChordAngle::Infinity();
+        if (exclusive) {
+            check_has_geographies("query_nearest with exclusive=True");
+        }
         if (query_geog.is_empty()) {
             return {};
         }
 
-        S2ClosestEdgeQuery query(&m_index->ShapeIndex());
+        S2ClosestEdgeQuery query(&shape_index());
         // count the interior of indexed polygons (resp. of the query
         // geography) as distance zero, consistent with spherely.distance
         query.mutable_options()->set_include_interiors(true);
@@ -488,10 +1020,9 @@ private:
         auto zero_hits = collect_at_distance(query, target, S1ChordAngle::Zero());
         auto equals_pred = get_predicate("equals");
         const auto& query_index = query_geog.geog_index();
-        auto* data = static_cast<PyObjectGeography*>(m_geographies.request().ptr);
         std::vector<int> non_equal;
         for (int t : zero_hits) {
-            if (!equals_pred(query_index, data[t].as_geog_ptr()->geog_index())) {
+            if (!equals_pred(query_index, candidate_geog(t)->geog_index())) {
                 non_equal.push_back(t);
             }
         }
@@ -590,7 +1121,9 @@ void init_spatial_index(py::module& m) {
         The index is built lazily, so without this call the first query pays
         the whole build cost. Calling it is optional, never changes the result
         of a query made with a ``predicate``, and does nothing once the index
-        is built (see :py:attr:`SpatialIndex.is_built`).
+        is built (see :py:attr:`SpatialIndex.is_built`) -- including on an
+        index loaded with :py:meth:`SpatialIndex.from_encoded`, which has no
+        build to force.
 
         Parameters
         ----------
@@ -638,12 +1171,18 @@ void init_spatial_index(py::module& m) {
 
         ``False`` between the constructor and the first
         :py:meth:`SpatialIndex.build` or query, ``True`` afterwards. An index
-        over an empty collection is ``True`` from the start.
+        over an empty collection is ``True`` from the start, and so is one
+        loaded with :py:meth:`SpatialIndex.from_encoded` (which decodes on
+        demand and has nothing to build).
 
     )pbdoc")
         .def_property_readonly("geometries",
                                &SpatialIndex::geometries,
                                "The array of geographies in the index (in input order).")
+        .def_property_readonly("_decoded_count",
+                               &SpatialIndex::decoded_count,
+                               "Number of geographies reconstructed so far by an index loaded "
+                               "from encoded bytes (testing/introspection only).")
         .def("encode",
              &SpatialIndex::encode,
              py::arg("include_geographies") = true,
@@ -652,12 +1191,17 @@ void init_spatial_index(py::module& m) {
         Serialize the index to bytes.
 
         By default the Geography objects themselves are serialized along with
-        the index structure. The shape data is stored only once (inside the
-        serialized geographies). With ``include_geographies=False`` an
-        index-only blob is written instead. It is the smaller of the two, by
-        an amount that depends on the geometry mix: in measurements the
-        default blob ran from about 1.1x the index-only one (polygon-heavy
-        indexes) to about 2x (small point-only ones).
+        the index structure, so that :py:meth:`SpatialIndex.from_encoded`
+        restores a fully functional index. The shape data is stored only once
+        (inside the serialized geographies, which the decoded index reads its
+        shapes from). With ``include_geographies=False`` an index-only blob
+        is written instead. It is the smaller of the two, by an amount that
+        depends on the geometry mix: in measurements the default blob ran
+        from about 1.1x the index-only one (polygon-heavy indexes) to about
+        2x (small point-only ones). The loaded index does not support the
+        operations that need the Geography objects, and its distance queries
+        decode individual shapes rather than whole geographies (see
+        :py:meth:`SpatialIndex.from_encoded`).
 
         .. warning::
            The encoded bytes are not a portable interchange format: past a
@@ -683,6 +1227,60 @@ void init_spatial_index(py::module& m) {
         -------
         bytes
             The encoded index.
+
+    )pbdoc")
+        .def_static("from_encoded",
+                    &SpatialIndex::from_encoded,
+                    py::arg("encoded"),
+                    R"pbdoc(from_encoded(encoded)
+
+        Load an index serialized with :py:meth:`SpatialIndex.encode`.
+
+        The returned index is a lazy view on the encoded bytes: loading it is
+        near-instant regardless of the index size, and the index cells are
+        only decoded on demand by queries. For bytes written with
+        ``include_geographies=True`` (the default) the Geography of a tree
+        entry is reconstructed the first time an operation touches that
+        entry: by predicate refinement of a candidate, by a distance query
+        (``query_nearest``) examining one of the entry's shapes, or by the
+        ``geometries`` property (which reconstructs all entries). Candidate
+        queries (``query`` without a predicate) only walk the index cells
+        and reconstruct nothing. Reconstruction of an entry decodes that
+        geography completely (through the same code path as unpickling a
+        Geography) and the result is cached, so each entry pays this cost at
+        most once and untouched entries never pay it.
+
+        ``query_nearest`` is the costly one: it reconstructs every entry
+        whose shapes the distance search examines, and it reconstructs them
+        whole even though it only needs one shape of each. That is a few
+        tens of geographies per call -- in measurements on point indexes of
+        100 to 20,000 entries, between about 10 and 80, so near-constant in
+        the size of the index rather than proportional to it -- against the
+        single shapes an index-only blob decodes for the same query.
+
+        The decoded index supports every operation with the same results --
+        including the same integer indices -- as the index it was encoded
+        from. For bytes written with ``include_geographies=False`` the
+        Geography objects are not available, so the ``geometries`` property,
+        ``query`` with a predicate and ``query_nearest`` with
+        ``exclusive=True`` raise ``ValueError``.
+
+        Only bytes written by :py:meth:`SpatialIndex.encode` from the same
+        spherely build are supported -- see the warning there about the
+        format's coupling to s2geometry. Corrupt or foreign bytes raise
+        ``ValueError``.
+
+        Parameters
+        ----------
+        encoded : bytes-like
+            An index serialized with :py:meth:`SpatialIndex.encode`, as any
+            contiguous bytes-like object (``bytes``, ``bytearray``,
+            ``memoryview``, ...). The bytes are copied.
+
+        Returns
+        -------
+        :py:class:`SpatialIndex`
+            The loaded index.
 
     )pbdoc")
         .def("query",
