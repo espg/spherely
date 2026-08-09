@@ -1,5 +1,3 @@
-#include <absl/flags/commandlineflag.h>
-#include <absl/flags/reflection.h>
 #include <pybind11/stl.h>
 #include <s2/mutable_s2shape_index.h>
 #include <s2/s2cell_id.h>
@@ -19,6 +17,7 @@
 #include "geography.hpp"
 #include "predicates.hpp"
 #include "pybind11.hpp"
+#include "s2_tmp_memory_budget.hpp"
 
 namespace py = pybind11;
 namespace s2geog = s2geography;
@@ -26,52 +25,31 @@ using namespace spherely;
 
 namespace {
 
-constexpr const char* kTmpMemoryBudgetFlag = "s2shape_index_tmp_memory_budget";
-
 /*
-** Sets s2geometry's process-wide index-build temporary memory budget for the
-** lifetime of the guard and puts the previous value back on destruction,
-** including when the build throws, so an override cannot leak out of the build
-** it was requested for.
+** Sets s2geometry's process-wide index-build temporary memory budget
+** (``FLAGS_s2shape_index_tmp_memory_budget``) for the lifetime of the guard and
+** puts the previous value back when it goes out of scope, so an override cannot
+** leak out of the build it was requested for.
 **
-** The flag is reached by name through absl's reflection API rather than as
-** ``FLAGS_s2shape_index_tmp_memory_budget``: ABSL_DECLARE_FLAG expands to a
-** plain ``extern`` with no ``dllimport``, so taking that data symbol's address
-** does not link against a shared s2 on Windows. The cost is that the value
-** round-trips through a string and the parse can fail; a lookup that finds no
-** such flag skips the override.
+** The flag is read and written through spherely::get/set_s2_tmp_memory_budget,
+** which own the declaration it needs (see s2_tmp_memory_budget.cpp) -- reaching
+** it directly from this file would not link against a shared s2 on Windows.
 */
 class TmpMemoryBudgetGuard {
 public:
-    explicit TmpMemoryBudgetGuard(std::int64_t bytes)
-        : m_flag(absl::FindCommandLineFlag(kTmpMemoryBudgetFlag)) {
-        if (m_flag == nullptr) {
-            return;
-        }
-        m_previous = m_flag->CurrentValue();
-        std::string error;
-        if (!m_flag->ParseFrom(std::to_string(bytes), &error)) {
-            m_flag = nullptr;  // nothing was changed, so nothing to restore
-            throw py::value_error("could not set tmp_memory_budget: " + error);
-        }
+    explicit TmpMemoryBudgetGuard(std::int64_t bytes) : m_previous(get_s2_tmp_memory_budget()) {
+        set_s2_tmp_memory_budget(bytes);
     }
 
     ~TmpMemoryBudgetGuard() {
-        if (m_flag == nullptr) {
-            return;
-        }
-        // a destructor cannot report a failed restore, and the value it is
-        // putting back came from the flag itself, so swallow the result
-        std::string error;
-        m_flag->ParseFrom(m_previous, &error);
+        set_s2_tmp_memory_budget(m_previous);
     }
 
     TmpMemoryBudgetGuard(const TmpMemoryBudgetGuard&) = delete;
     TmpMemoryBudgetGuard& operator=(const TmpMemoryBudgetGuard&) = delete;
 
 private:
-    absl::CommandLineFlag* m_flag;
-    std::string m_previous;
+    std::int64_t m_previous;
 };
 
 }  // namespace
@@ -264,16 +242,16 @@ void init_spatial_index(py::module& m) {
         memory budget.
 
         The index is built lazily, so without this call the first query pays
-        the whole build cost. Calling it is optional, never changes query
-        results, and does nothing once the index is built (see
-        :py:attr:`SpatialIndex.is_built`).
+        the whole build cost. Calling it is optional, never changes the result
+        of a query made with a ``predicate``, and does nothing once the index
+        is built (see :py:attr:`SpatialIndex.is_built`).
 
         Parameters
         ----------
         tmp_memory_budget : int, optional
             Temporary memory budget for this build, in bytes. s2geometry builds
             the index in batches sized to fit it, and many batches cost more
-            than one, so the knob is only useful *raised*; about 140 bytes per
+            than one, so the knob is only useful *raised*; about 226 bytes per
             edge is enough to build in a single batch. Must be strictly
             positive, and must fit in a signed 64-bit integer (larger values
             raise ``TypeError``). The previous value is put back when the call
@@ -287,6 +265,14 @@ void init_spatial_index(py::module& m) {
         -----
         Peak resident memory can rise by roughly the budget granted, and
         nothing is granted unless a budget is passed.
+
+        The budget changes where s2geometry places its batch boundaries, and so
+        how it subdivides the index. A query made without a ``predicate`` can
+        therefore return a different candidate set under a different budget --
+        candidates may be added *or* dropped, and the sets for two budgets need
+        not be nested. What does not change is that the candidate set is always
+        a superset of the true matches, so any ``predicate`` refines it to the
+        same answer.
 
         This call holds the GIL for its whole duration -- minutes, for a large
         collection -- and the budget is a process-wide s2geometry setting for
@@ -348,16 +334,13 @@ void init_spatial_index(py::module& m) {
              py::arg("geography"),
              py::arg("predicate") = py::none());
 
-    // Not public API: exposed so that the test suite can assert that
-    // SpatialIndex.build() puts the process-wide budget back.
-    m.def(
-        "_s2_tmp_memory_budget",
-        []() -> std::int64_t {
-            const auto* flag = absl::FindCommandLineFlag(kTmpMemoryBudgetFlag);
-            if (flag == nullptr) {
-                throw py::value_error(std::string("no such s2 flag: ") + kTmpMemoryBudgetFlag);
-            }
-            return std::stoll(flag->CurrentValue());
-        },
-        "Return s2geometry's current index-build temporary memory budget, in bytes.");
+    // Not public API: exposed so that the test suite can move the process-wide
+    // budget off its default and assert what SpatialIndex.build() puts back.
+    m.def("_s2_tmp_memory_budget",
+          &get_s2_tmp_memory_budget,
+          "Return s2geometry's current index-build temporary memory budget, in bytes.");
+    m.def("_set_s2_tmp_memory_budget",
+          &set_s2_tmp_memory_budget,
+          py::arg("bytes"),
+          "Set s2geometry's index-build temporary memory budget, in bytes.");
 }

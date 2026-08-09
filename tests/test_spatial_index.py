@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
@@ -5,6 +6,11 @@ import numpy.typing as npt
 import pytest
 
 import spherely
+
+
+def _pairs(result: npt.NDArray[np.intp]) -> set[tuple[Any, ...]]:
+    # the (2, N) result of an array query as a set of (input, tree) pairs
+    return set(map(tuple, result.T))
 
 
 @pytest.fixture
@@ -108,7 +114,7 @@ def test_build_does_not_change_results(geographies: npt.NDArray[Any]) -> None:
 # the s2 default and two raised budgets -- raising is the only useful
 # direction, see the SpatialIndex.build docstring
 @pytest.mark.parametrize("budget", [104_857_600, 1024**3, 4 * 1024**3])
-def test_build_budget_does_not_change_results(
+def test_build_budget_does_not_change_matches(
     geographies: npt.NDArray[Any], budget: int
 ) -> None:
     poly = spherely.create_polygon([(-1, -1), (3, -1), (3, 3), (-1, 3), (-1, -1)])
@@ -119,11 +125,12 @@ def test_build_budget_does_not_change_results(
     tuned.build(tmp_memory_budget=budget)
     assert tuned.is_built
 
-    np.testing.assert_array_equal(tuned.query(poly), default.query(poly))
-    np.testing.assert_array_equal(
-        tuned.query(poly, predicate="contains"),
-        default.query(poly, predicate="contains"),
-    )
+    # the budget moves s2's batch boundaries and with them the subdivision of
+    # the index, so the unrefined candidate set is only guaranteed to stay a
+    # superset of the matches -- what is invariant is the refined answer
+    matches = tuned.query(poly, predicate="contains")
+    np.testing.assert_array_equal(matches, default.query(poly, predicate="contains"))
+    assert set(matches) <= set(tuned.query(poly))
 
 
 def test_build_budget_below_default_is_legal(geographies: npt.NDArray[Any]) -> None:
@@ -137,7 +144,57 @@ def test_build_budget_below_default_is_legal(geographies: npt.NDArray[Any]) -> N
     tiny.build(tmp_memory_budget=1)
     assert tiny.is_built
 
-    np.testing.assert_array_equal(tiny.query(poly), default.query(poly))
+    matches = tiny.query(poly, predicate="contains")
+    np.testing.assert_array_equal(matches, default.query(poly, predicate="contains"))
+    assert set(matches) <= set(tiny.query(poly))
+
+
+def _overlapping_geographies() -> tuple[npt.NDArray[Any], npt.NDArray[Any]]:
+    # 600 overlapping 30-gons and 50 polygon queries over the same patch: big
+    # enough that the coarse candidate set holds real false positives, and that
+    # a budget below the default splits the build into several batches (18000
+    # edges at s2geometry's 226 temporary bytes per edge is about 4 MB)
+    rng = np.random.default_rng(7)
+
+    def polygon(
+        cx: float, cy: float, radius: float, nvertices: int
+    ) -> spherely.Geography:
+        angles = np.linspace(0, 2 * np.pi, nvertices, endpoint=False)
+        coords = [
+            (cx + radius * np.cos(a), cy + radius * np.sin(a)) for a in angles.tolist()
+        ]
+        return spherely.create_polygon(coords + [coords[0]])
+
+    indexed = np.array(
+        [polygon(rng.uniform(-1, 1), rng.uniform(-1, 1), 0.3, 30) for _ in range(600)]
+    )
+    queries = np.array(
+        [polygon(rng.uniform(-1, 1), rng.uniform(-1, 1), 0.2, 8) for _ in range(50)]
+    )
+    return indexed, queries
+
+
+def test_build_budget_does_not_change_matches_on_larger_collection() -> None:
+    indexed, queries = _overlapping_geographies()
+
+    default = spherely.SpatialIndex(indexed)
+    default.build()
+    expected = default.query(queries, predicate="intersects")
+
+    # unlike the four-geography fixture above, here the coarse candidate set is
+    # strictly larger than the matches, so "superset of the matches" is a real
+    # constraint rather than an accident of the collection's size
+    assert _pairs(expected) < _pairs(default.query(queries))
+
+    # 1 MiB forces the build into several batches (this collection needs about
+    # 4 MB of temporary space) while 4 GiB builds it in one, as the default
+    # does here: the candidate sets need not agree, the matches do
+    for budget in (1024**2, 4 * 1024**3):
+        tuned = spherely.SpatialIndex(indexed)
+        tuned.build(tmp_memory_budget=budget)
+        matches = tuned.query(queries, predicate="intersects")
+        np.testing.assert_array_equal(matches, expected)
+        assert _pairs(matches) <= _pairs(tuned.query(queries))
 
 
 @pytest.mark.parametrize("budget", [0, -1, -(1024**3)])
@@ -185,7 +242,40 @@ def test_build_budget_is_restored(geographies: npt.NDArray[Any]) -> None:
     plain = spherely.SpatialIndex(geographies)
     plain.build()
     assert spherely._s2_tmp_memory_budget() == before
-    np.testing.assert_array_equal(plain.query(poly), tuned.query(poly))
+    np.testing.assert_array_equal(
+        plain.query(poly, predicate="contains"),
+        tuned.query(poly, predicate="contains"),
+    )
+
+
+@pytest.fixture
+def restore_s2_budget() -> Iterator[None]:
+    # for the tests below, which move the process-wide s2 setting themselves
+    before = spherely._s2_tmp_memory_budget()
+    yield
+    spherely._set_s2_tmp_memory_budget(before)
+
+
+def test_s2_tmp_memory_budget_round_trip(restore_s2_budget: None) -> None:
+    # the accessors reach the real s2 flag: what is set is what is read back
+    spherely._set_s2_tmp_memory_budget(4096)
+    assert spherely._s2_tmp_memory_budget() == 4096
+    spherely._set_s2_tmp_memory_budget(8192)
+    assert spherely._s2_tmp_memory_budget() == 8192
+
+
+def test_build_budget_restores_previous_value(
+    geographies: npt.NDArray[Any], restore_s2_budget: None
+) -> None:
+    # test_build_budget_is_restored runs at s2geometry's default, where putting
+    # the previous value back and resetting to the default are the same thing;
+    # start from a non-default value so that only the former passes
+    spherely._set_s2_tmp_memory_budget(4096)
+
+    tree = spherely.SpatialIndex(geographies)
+    tree.build(tmp_memory_budget=8192)
+    assert tree.is_built
+    assert spherely._s2_tmp_memory_budget() == 4096
 
 
 def test_build_empty_index() -> None:
