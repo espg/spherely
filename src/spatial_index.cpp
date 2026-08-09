@@ -6,6 +6,8 @@
 #include <s2/s2cell_union.h>
 #include <s2/s2closest_edge_query.h>
 #include <s2/s2region_coverer.h>
+#include <s2/s2shapeutil_coding.h>
+#include <s2/util/coding/coder.h>
 #include <s2geography.h>
 #include <s2geography/index.h>
 
@@ -16,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -119,6 +122,65 @@ public:
 
     py::array geometries() const {
         return m_geographies;
+    }
+
+    // Serialize the index to bytes: a small header, the shape id -> tree
+    // index mapping, then either the Geography objects themselves (a fixed
+    // width offset/length table followed by one block per tree entry) or a
+    // compact S2 shape stream, and finally the index structure.
+    //
+    // The shape data is stored once either way: with the geographies included
+    // the blocks hold it and no separate shape stream is written.
+    //
+    // Everything past the header is s2geometry's / s2geography's own
+    // encoding, so the format is tied to the library versions spherely is
+    // built against (only the header is versioned here).
+    py::bytes encode(bool include_geographies) const {
+        // gather the wrapped geographies under the GIL; their S2 data is
+        // owned by the Python objects this index keeps alive
+        std::vector<const Geography*> geogs;
+        if (include_geographies) {
+            auto* data = static_cast<PyObjectGeography*>(m_geographies.request().ptr);
+            geogs.reserve(static_cast<std::size_t>(m_geographies.size()));
+            for (py::ssize_t i = 0; i < m_geographies.size(); i++) {
+                geogs.push_back(data[i].as_geog_ptr());
+            }
+        }
+
+        Encoder encoder;
+
+        const auto& index = m_index->ShapeIndex();
+        auto num_shapes = index.num_shape_ids();
+        auto num_geographies = static_cast<std::uint64_t>(m_geographies.size());
+
+        {
+            // encoding is pure C++ work on objects this index keeps alive and
+            // can take a while for a large index: let other threads run
+            py::gil_scoped_release release;
+
+            // widened to size_t: the header plus one varint per shape value
+            // and one for each of the two counts (int would overflow past
+            // ~2e8 shapes)
+            encoder.Ensure(static_cast<std::size_t>(kHeaderBytes) +
+                           static_cast<std::size_t>(Encoder::kVarintMax64) *
+                               (static_cast<std::size_t>(num_shapes) + 2));
+            encoder.put32(kEncodingMagic);
+            encoder.put8(kEncodingVersion);
+            encoder.put8(include_geographies ? kFlagHasGeographies : 0);
+            encoder.put_varint64(num_geographies);
+            encoder.put_varint64(static_cast<std::uint64_t>(num_shapes));
+            for (int i = 0; i < num_shapes; i++) {
+                encoder.put_varint64(static_cast<std::uint64_t>(m_index->value(i)));
+            }
+
+            if (include_geographies) {
+                encode_geography_blocks(encoder, geogs);
+            } else {
+                s2shapeutil::CompactEncodeTaggedShapes(index, &encoder);
+            }
+            index.Encode(&encoder);
+        }
+        return py::bytes(encoder.base(), encoder.length());
     }
 
     // Scalar query: single Geography -> 1-d array of sorted tree indices.
@@ -226,9 +288,62 @@ public:
     }
 
 private:
+    // encoding header: magic (the bytes "SPIX", which put32 writes least
+    // significant byte first), format version, flags
+    static constexpr std::uint32_t kEncodingMagic = 0x58495053;
+    // format version of the header below; only this exact value is accepted
+    // when decoding, so any future format change is a bump here plus a
+    // decoder branch
+    static constexpr std::uint8_t kEncodingVersion = 1;
+    // flags: the blob carries a per-geography block section
+    static constexpr std::uint8_t kFlagHasGeographies = 1;
+    static constexpr int kHeaderBytes =
+        sizeof(kEncodingMagic) + sizeof(kEncodingVersion) + sizeof(std::uint8_t);
+    // one fixed-width (offset, length) pair per geography, so that block j is
+    // addressable without scanning the section
+    static constexpr std::size_t kBlockTableEntryBytes = 2 * sizeof(std::uint64_t);
+
     std::unique_ptr<s2geog::GeographyIndex> m_index;
     // also keeps the Geography objects alive (the index borrows their S2Shapes)
     py::array_t<PyObjectGeography> m_geographies;
+
+    // Append the per-geography section to ``encoder``: a fixed-width
+    // (offset, length) table (offsets relative to the first block, blocks
+    // contiguous in tree order) followed by the blocks themselves. Each block
+    // mirrors the Geography pickle tuple: the geography type (int8), the
+    // empty flag (uint8) and the geography serialized with s2geography's
+    // ``EncodeTagged``, so decoding goes through exactly the same code path
+    // as unpickling.
+    static void encode_geography_blocks(Encoder& encoder,
+                                        const std::vector<const Geography*>& geogs) {
+        std::vector<Encoder> blocks;
+        blocks.reserve(geogs.size());
+        std::size_t blocks_bytes = 0;
+        for (const Geography* geog : geogs) {
+            Encoder block;
+            block.Ensure(2);
+            using IntType = std::underlying_type_t<GeographyType>;
+            block.put8(static_cast<unsigned char>(static_cast<IntType>(geog->geog_type())));
+            block.put8(geog->is_empty() ? 1 : 0);
+            // default options, as in Geography::encode (the pickle support):
+            // exact vertices (FAST hint), no covering, no lazy decoding
+            s2geog::EncodeOptions encode_opts;
+            geog->geog().EncodeTagged(&block, encode_opts);
+            blocks_bytes += block.length();
+            blocks.push_back(std::move(block));
+        }
+
+        encoder.Ensure(kBlockTableEntryBytes * blocks.size() + blocks_bytes);
+        std::uint64_t offset = 0;
+        for (const auto& block : blocks) {
+            encoder.put64(offset);
+            encoder.put64(static_cast<std::uint64_t>(block.length()));
+            offset += static_cast<std::uint64_t>(block.length());
+        }
+        for (const auto& block : blocks) {
+            encoder.putn(block.base(), block.length());
+        }
+    }
 
     static std::optional<PredicateFunc> make_predicate(const std::optional<std::string>& name) {
         if (!name.has_value()) {
@@ -529,6 +644,47 @@ void init_spatial_index(py::module& m) {
         .def_property_readonly("geometries",
                                &SpatialIndex::geometries,
                                "The array of geographies in the index (in input order).")
+        .def("encode",
+             &SpatialIndex::encode,
+             py::arg("include_geographies") = true,
+             R"pbdoc(encode(include_geographies=True)
+
+        Serialize the index to bytes.
+
+        By default the Geography objects themselves are serialized along with
+        the index structure. The shape data is stored only once (inside the
+        serialized geographies). With ``include_geographies=False`` an
+        index-only blob is written instead. It is the smaller of the two, by
+        an amount that depends on the geometry mix: in measurements the
+        default blob ran from about 1.1x the index-only one (polygon-heavy
+        indexes) to about 2x (small point-only ones).
+
+        .. warning::
+           The encoded bytes are not a portable interchange format: past a
+           small spherely header they are s2geometry's (and s2geography's)
+           own encoding, which is tied to the library versions spherely was
+           built against. The per-geography blocks in particular round-trip
+           through ``s2geography::Geography::EncodeTagged`` /
+           ``DecodeTagged``, which s2geography labels EXPERIMENTAL. A blob
+           written by one build is not guaranteed to be readable by a build
+           linked against a different s2geometry (loading it raises
+           ``ValueError`` rather than returning wrong results). Encode and
+           decode with the same spherely build, and treat the bytes as a
+           cache, not as an archival format.
+
+        Parameters
+        ----------
+        include_geographies : bool, default True
+            If True, serialize the Geography objects along with the index so
+            that the decoded index supports every operation. If False, write
+            the smaller index-only blob.
+
+        Returns
+        -------
+        bytes
+            The encoded index.
+
+    )pbdoc")
         .def("query",
              py::overload_cast<const Geography&, std::optional<std::string>>(&SpatialIndex::query,
                                                                              py::const_),

@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -722,3 +723,31 @@ def test_query_nearest_against_distance_oracle() -> None:
         distances = np.asarray(spherely.distance(query, geographies))
         expected = np.flatnonzero(distances == distances.min())
         np.testing.assert_array_equal(result, expected)
+
+
+def test_encode(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    encoded = tree.encode()
+    assert isinstance(encoded, bytes)
+    assert len(encoded) > 0
+    # magic, format version and flags (geographies included by default)
+    assert encoded[:6] == b"SPIX\x01\x01"
+    # encoding is deterministic
+    assert tree.encode() == encoded
+
+    thin = tree.encode(include_geographies=False)
+    assert thin[:6] == b"SPIX\x01\x00"
+    # the thin blob drops the per-geography blocks (and their offset table)
+    assert len(thin) < len(encoded)
+    assert tree.encode(include_geographies=False) == thin
+
+
+def test_encode_concurrent() -> None:
+    # encode() releases the GIL around the (pure C++) encoding work
+    geoms = [spherely.create_point(x, x % 80) for x in range(200)]
+    tree = spherely.SpatialIndex(geoms)
+    expected = tree.encode()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: tree.encode(), range(8)))
+    assert all(result == expected for result in results)

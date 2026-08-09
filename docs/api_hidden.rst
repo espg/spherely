@@ -8,6 +8,7 @@
    Geography
    SpatialIndex
    SpatialIndex.build
+   SpatialIndex.encode
    SpatialIndex.geometries
    SpatialIndex.is_built
    SpatialIndex.query
