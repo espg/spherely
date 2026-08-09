@@ -802,6 +802,39 @@ def test_encode_concurrent() -> None:
     assert all(result == expected for result in results)
 
 
+def test_shape_ids_map_to_tree_indices() -> None:
+    # the shape id -> tree index map is filled by the constructor rather than
+    # by s2geography::GeographyIndex::Add: geographies with several shapes
+    # (and ones with none) must still line up with their input positions
+    geoms = [
+        spherely.create_point(0, 0),
+        spherely.create_collection(  # two shapes
+            [
+                spherely.create_point(30, 30),
+                spherely.create_linestring([(31, 31), (32, 32)]),
+            ]
+        ),
+        spherely.create_polygon(None),  # empty: no shape
+        spherely.create_point(-60, -60),
+    ]
+    tree = spherely.SpatialIndex(geoms)
+    assert len(tree) == 4
+
+    for i, geog in enumerate(geoms):
+        if i == 2:  # the empty geography is indexed but never returned
+            continue
+        np.testing.assert_array_equal(tree.query(geog, predicate="intersects"), [i])
+        np.testing.assert_array_equal(tree.query_nearest(geog), [i])
+
+    # both shapes of the collection resolve to its tree index, and only once
+    np.testing.assert_array_equal(
+        tree.query(spherely.create_point(31.5, 31.5), predicate="intersects"), []
+    )
+    np.testing.assert_array_equal(
+        tree.query_nearest(spherely.create_point(31.5, 31.5)), [1]
+    )
+
+
 def test_from_encoded_preserves_indices() -> None:
     # multi-shape and empty geographies make the shape id <-> tree index
     # mapping non-trivial: it must survive the encode / from_encoded round

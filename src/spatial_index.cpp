@@ -86,8 +86,25 @@ public:
 
         auto n = m_geographies.size();
         auto* data = static_cast<PyObjectGeography*>(m_geographies.request().ptr);
+        // this is what s2geography::GeographyIndex::Add does, except that it
+        // keeps the shape id -> value mapping in a vector it grows with
+        // ``reserve(size() + num_shapes)`` per geography. libc++ reserves
+        // exactly and the ``resize`` that follows leaves capacity == size, so
+        // every call reallocates and copies the whole vector: quadratic, and
+        // 15 s of pure vector growth for 555k polygons (0.04 s here).
+        // Reserving once and adding the shapes to the shape index directly
+        // builds exactly the same index. This is a workaround for the
+        // dependency -- it can go away once s2geography grows that vector
+        // geometrically.
+        auto& mutable_index = m_index->MutableShapeIndex();
+        m_values.reserve(static_cast<std::size_t>(n));
         for (py::ssize_t i = 0; i < n; i++) {
-            m_index->Add(data[i].as_geog_ptr()->geog(), static_cast<int>(i));
+            const auto& geog = data[i].as_geog_ptr()->geog();
+            for (int k = 0; k < geog.num_shapes(); k++) {
+                int shape_id = mutable_index.Add(geog.Shape(k));
+                m_values.resize(static_cast<std::size_t>(shape_id) + 1);
+                m_values[static_cast<std::size_t>(shape_id)] = static_cast<int>(i);
+            }
         }
     }
 
@@ -240,7 +257,8 @@ public:
             encoder.put_varint64(num_geographies);
             encoder.put_varint64(static_cast<std::uint64_t>(num_shapes));
             for (int i = 0; i < num_shapes; i++) {
-                encoder.put_varint64(static_cast<std::uint64_t>(m_index->value(i)));
+                encoder.put_varint64(
+                    static_cast<std::uint64_t>(m_values.at(static_cast<std::size_t>(i))));
             }
 
             if (include_geographies) {
@@ -502,16 +520,22 @@ private:
     // destroyed in reverse declaration order, and an S2ShapeIndex touches its
     // shapes while being torn down.
 
+    // shape id -> tree index, filled by the constructor (built mode) or read
+    // back out of the blob by ``from_encoded`` (encoded mode)
+    std::vector<int> m_values;
+
     // built mode (constructed from an array of geographies)
     // m_geographies keeps the Geography objects alive (the index borrows
     // their S2Shapes)
     py::array_t<PyObjectGeography> m_geographies;
+    // wrapped for its S2ShapeIndex only: the constructor fills m_values
+    // itself, so this GeographyIndex's own shape id -> value table stays
+    // empty and neither its value() nor its Iterator may be used
     std::unique_ptr<s2geog::GeographyIndex> m_index;
 
     // encoded mode (loaded with from_encoded); the encoded bytes are kept
     // alive here as EncodedS2ShapeIndex works directly on them
     std::string m_encoded;
-    std::vector<int> m_values;
     py::ssize_t m_num_geographies = 0;
     // whether the blob carries per-geography blocks, and where each block
     // lives inside ``m_encoded`` (absolute offset, length)
@@ -836,12 +860,11 @@ private:
 
     // tree index of the geography that owns the given shape
     int tree_value(int shape_id) const {
-        if (is_encoded()) {
-            // ``from_encoded`` checks the table covers every shape id; ``at``
-            // keeps a mismatch a Python exception rather than a bad read
-            return m_values.at(static_cast<std::size_t>(shape_id));
-        }
-        return m_index->value(shape_id);
+        // the constructor covers every shape of a built index and
+        // ``from_encoded`` checks that the decoded table covers every shape
+        // id; ``at`` keeps a mismatch a Python exception rather than a bad
+        // read
+        return m_values.at(static_cast<std::size_t>(shape_id));
     }
 
     std::optional<PredicateFunc> make_predicate(const std::optional<std::string>& name) const {
