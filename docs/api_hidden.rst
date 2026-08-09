@@ -11,6 +11,7 @@
    SpatialIndex.geometries
    SpatialIndex.is_built
    SpatialIndex.query
+   SpatialIndex.query_nearest
    Projection
    Projection.lnglat
    Projection.pseudo_mercator

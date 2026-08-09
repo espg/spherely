@@ -254,6 +254,73 @@ class SpatialIndex:
     def query(
         self, geography: Iterable[Geography], predicate: _IndexPredicate | None = None
     ) -> npt.NDArray[np.intp]: ...
+    # every argument may also be passed positionally (as in shapely); the
+    # trailing overloads cover a ``return_distance`` value only known at
+    # runtime
+    @overload
+    def query_nearest(
+        self,
+        geography: Geography,
+        max_distance: float | None = None,
+        return_distance: Literal[False] = False,
+        exclusive: bool = False,
+        all_matches: bool = True,
+        radius: float = 6371010.0,
+    ) -> npt.NDArray[np.intp]: ...
+    @overload
+    def query_nearest(
+        self,
+        geography: Iterable[Geography],
+        max_distance: float | None = None,
+        return_distance: Literal[False] = False,
+        exclusive: bool = False,
+        all_matches: bool = True,
+        radius: float = 6371010.0,
+    ) -> npt.NDArray[np.intp]: ...
+    @overload
+    def query_nearest(
+        self,
+        geography: Geography,
+        max_distance: float | None = None,
+        return_distance: Literal[True] = ...,
+        exclusive: bool = False,
+        all_matches: bool = True,
+        radius: float = 6371010.0,
+    ) -> tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]: ...
+    @overload
+    def query_nearest(
+        self,
+        geography: Iterable[Geography],
+        max_distance: float | None = None,
+        return_distance: Literal[True] = ...,
+        exclusive: bool = False,
+        all_matches: bool = True,
+        radius: float = 6371010.0,
+    ) -> tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]: ...
+    @overload
+    def query_nearest(
+        self,
+        geography: Geography,
+        max_distance: float | None = None,
+        return_distance: bool = False,
+        exclusive: bool = False,
+        all_matches: bool = True,
+        radius: float = 6371010.0,
+    ) -> (
+        npt.NDArray[np.intp] | tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]
+    ): ...
+    @overload
+    def query_nearest(
+        self,
+        geography: Iterable[Geography],
+        max_distance: float | None = None,
+        return_distance: bool = False,
+        exclusive: bool = False,
+        all_matches: bool = True,
+        radius: float = 6371010.0,
+    ) -> (
+        npt.NDArray[np.intp] | tuple[npt.NDArray[np.intp], npt.NDArray[np.float64]]
+    ): ...
 
 def _s2_tmp_memory_budget() -> int: ...
 def _set_s2_tmp_memory_budget(bytes: int) -> None: ...

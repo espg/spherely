@@ -366,3 +366,359 @@ def test_query_invalid_predicate(geographies: npt.NDArray[Any]) -> None:
     point = spherely.create_point(1, 1)
     with pytest.raises(ValueError, match="invalid predicate"):
         tree.query(point, predicate="not_a_predicate")  # type: ignore[call-overload]
+
+
+def test_query_nearest_scalar(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    result = tree.query_nearest(spherely.create_point(1.2, 1.2))
+    assert result.dtype == np.intp
+    np.testing.assert_array_equal(result, [1])
+
+
+def test_query_nearest_ties() -> None:
+    # two points exactly symmetric about the query point on the equator
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_point(-2, 0),
+            spherely.create_point(2, 0),
+            spherely.create_point(50, 0),
+        ]
+    )
+    query = spherely.create_point(0, 0)
+    np.testing.assert_array_equal(tree.query_nearest(query), [0, 1])
+
+    single = tree.query_nearest(query, all_matches=False)
+    np.testing.assert_array_equal(single, [0])
+
+
+def test_query_nearest_ties_lowest_index() -> None:
+    # more than two geographies tied at the minimum distance: all_matches=False
+    # returns the lowest index, not an arbitrary member of the tie
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_point(50, 0),  # far away
+            spherely.create_point(2, 0),
+            spherely.create_point(-2, 0),
+            spherely.create_point(2, 0),  # duplicate of index 1
+        ]
+    )
+    query = spherely.create_point(0, 0)
+
+    np.testing.assert_array_equal(tree.query_nearest(query), [1, 2, 3])
+    np.testing.assert_array_equal(tree.query_nearest(query, all_matches=False), [1])
+
+    # array form (and with the distances)
+    queries = np.array([query, spherely.create_point(49, 0)])
+    single, distances = tree.query_nearest(
+        queries, all_matches=False, return_distance=True
+    )
+    np.testing.assert_array_equal(single, [[0, 1], [1, 0]])
+    np.testing.assert_allclose(
+        distances,
+        [
+            spherely.distance(query, spherely.create_point(2, 0)),
+            spherely.distance(queries[1], spherely.create_point(50, 0)),
+        ],
+    )
+
+
+def test_query_nearest_exclusive_ties_lowest_index() -> None:
+    # same, on the exclusive path: the geographies equal to the query are
+    # dropped and the lowest of the remaining tie is returned
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_point(0, 0),  # equal to the query
+            spherely.create_point(2, 0),
+            spherely.create_point(-2, 0),
+            spherely.create_point(2, 0),
+        ]
+    )
+    query = spherely.create_point(0, 0)
+    np.testing.assert_array_equal(tree.query_nearest(query, exclusive=True), [1, 2, 3])
+    np.testing.assert_array_equal(
+        tree.query_nearest(query, exclusive=True, all_matches=False), [1]
+    )
+
+    # ... and on the "everything at distance zero is equal" fallback path
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_point(0, 0),
+            spherely.create_point(0, 0),
+            spherely.create_point(2, 0),
+            spherely.create_point(-2, 0),
+        ]
+    )
+    np.testing.assert_array_equal(tree.query_nearest(query, exclusive=True), [2, 3])
+    np.testing.assert_array_equal(
+        tree.query_nearest(query, exclusive=True, all_matches=False), [2]
+    )
+
+
+def test_query_nearest_interior_distance_zero() -> None:
+    # a point inside an indexed polygon is at distance zero from it,
+    # consistent with spherely.distance
+    poly = spherely.create_polygon([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+    tree = spherely.SpatialIndex([poly, spherely.create_point(5.1, 5.1)])
+    inside = spherely.create_point(5, 5)
+    assert spherely.distance(inside, poly) == 0
+    np.testing.assert_array_equal(tree.query_nearest(inside), [0])
+
+    # and symmetrically: an indexed point inside a query polygon
+    tree = spherely.SpatialIndex(
+        [spherely.create_point(5, 5), spherely.create_point(20, 20)]
+    )
+    query_poly = spherely.create_polygon([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+    np.testing.assert_array_equal(tree.query_nearest(query_poly), [0])
+
+
+def test_query_nearest_empty_geographies() -> None:
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_polygon(None),  # empty, never returned
+            spherely.create_point(10, 10),
+        ]
+    )
+    np.testing.assert_array_equal(tree.query_nearest(spherely.create_point(0, 0)), [1])
+
+    # empty query geography -> no result
+    result = tree.query_nearest(spherely.create_polygon(None))
+    assert result.shape == (0,)
+
+    # empty tree -> no result
+    tree = spherely.SpatialIndex(np.array([], dtype=object))
+    result = tree.query_nearest(spherely.create_point(0, 0))
+    assert result.shape == (0,)
+
+
+def test_query_nearest_return_distance(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    query = spherely.create_point(1.2, 1.2)
+
+    indices, distances = tree.query_nearest(query, return_distance=True)
+    np.testing.assert_array_equal(indices, [1])
+    assert distances.dtype == np.float64
+    np.testing.assert_allclose(distances, spherely.distance(query, geographies[1]))
+
+    # the arguments may also be passed positionally, as in shapely
+    positional = tree.query_nearest(query, None, True)
+    np.testing.assert_array_equal(positional[0], indices)
+    np.testing.assert_array_equal(positional[1], distances)
+
+    # a return_distance only known at runtime is typed as the union of both
+    flag = bool(len(indices))
+    runtime = tree.query_nearest(query, return_distance=flag)
+    assert isinstance(runtime, tuple)
+
+    # radius scales the returned distances
+    _, unscaled = tree.query_nearest(query, return_distance=True, radius=1)
+    np.testing.assert_allclose(
+        unscaled * spherely.EARTH_RADIUS_METERS, distances, rtol=1e-15
+    )
+
+
+def test_query_nearest_array(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    queries = np.array(
+        [
+            spherely.create_point(1.2, 1.2),
+            spherely.create_point(49, 49),
+        ]
+    )
+
+    result = tree.query_nearest(queries)
+    assert result.dtype == np.intp
+    # (input_index, tree_index) pairs
+    np.testing.assert_array_equal(result, [[0, 1], [1, 3]])
+
+    pairs, distances = tree.query_nearest(queries, return_distance=True)
+    np.testing.assert_array_equal(pairs, result)
+    expected = [
+        spherely.distance(queries[0], geographies[1]),
+        spherely.distance(queries[1], geographies[3]),
+    ]
+    np.testing.assert_allclose(distances, expected)
+
+
+def test_query_nearest_array_ties_and_empty() -> None:
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_point(-2, 0),
+            spherely.create_point(2, 0),
+            spherely.create_point(50, 0),
+        ]
+    )
+    queries = np.array(
+        [
+            spherely.create_point(0, 0),  # tied between 0 and 1
+            spherely.create_polygon(None),  # empty: contributes no pairs
+            spherely.create_point(49, 0),
+        ]
+    )
+    result = tree.query_nearest(queries)
+    np.testing.assert_array_equal(result, [[0, 0, 2], [0, 1, 2]])
+
+    single = tree.query_nearest(queries, all_matches=False)
+    # ties are broken deterministically on the lowest tree index
+    np.testing.assert_array_equal(single, [[0, 2], [0, 2]])
+
+
+def test_query_nearest_max_distance(geographies: npt.NDArray[Any]) -> None:
+    tree = spherely.SpatialIndex(geographies)
+    query = spherely.create_point(1.2, 1.2)
+    dist = spherely.distance(query, geographies[1])
+
+    np.testing.assert_array_equal(
+        tree.query_nearest(query, max_distance=dist * 1.01), [1]
+    )
+    # inclusive bound
+    np.testing.assert_array_equal(tree.query_nearest(query, max_distance=dist), [1])
+
+    # no geography within max_distance -> empty result (shapely semantics)
+    result = tree.query_nearest(query, max_distance=1.0)
+    assert result.shape == (0,)
+    indices, distances = tree.query_nearest(
+        query, max_distance=1.0, return_distance=True
+    )
+    assert indices.shape == (0,)
+    assert distances.shape == (0,)
+
+    # array form
+    queries = np.array([query, spherely.create_point(49, 49)])
+    result = tree.query_nearest(queries, max_distance=dist * 1.01)
+    np.testing.assert_array_equal(result, [[0], [1]])
+
+    # array form with no match at all: (2, 0) pairs and 0 distances
+    pairs, distances = tree.query_nearest(
+        queries, max_distance=1.0, return_distance=True
+    )
+    assert pairs.shape == (2, 0)
+    assert pairs.dtype == np.intp
+    assert distances.shape == (0,)
+    assert distances.dtype == np.float64
+
+
+def test_query_nearest_max_distance_inclusive_boundary() -> None:
+    # the distance returned by query_nearest must itself be accepted as an
+    # (inclusive) max_distance: a fixture or two would not catch the ULP-level
+    # round trip error between meters and chord angles, so sweep many pairs
+    rng = np.random.default_rng(0)
+    lon = rng.uniform(-180, 180, 50)
+    lat = rng.uniform(-90, 90, 50)
+    tree = spherely.SpatialIndex(np.asarray(spherely.points(lon, lat)))
+
+    qlon = rng.uniform(-180, 180, 200)
+    qlat = rng.uniform(-90, 90, 200)
+    for query in np.asarray(spherely.points(qlon, qlat)):
+        expected, distances = tree.query_nearest(query, return_distance=True)
+        result = tree.query_nearest(query, max_distance=distances[0])
+        np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("max_distance", [0, -1.0, np.nan, np.inf, -np.inf])
+def test_query_nearest_invalid_max_distance(
+    geographies: npt.NDArray[Any], max_distance: float
+) -> None:
+    # NaN in particular used to be silently accepted as "no bound"
+    tree = spherely.SpatialIndex(geographies)
+    point = spherely.create_point(1, 1)
+    match = "max_distance must be a finite value greater than 0"
+    with pytest.raises(ValueError, match=match):
+        tree.query_nearest(point, max_distance=max_distance)
+    with pytest.raises(ValueError, match=match):
+        tree.query_nearest(np.array([point]), max_distance=max_distance)
+
+
+@pytest.mark.parametrize("radius", [0, -1.0, np.nan, np.inf])
+def test_query_nearest_invalid_radius(
+    geographies: npt.NDArray[Any], radius: float
+) -> None:
+    # the radius filters here (it scales max_distance): a zero radius would
+    # make every distance zero, a negative one would flip the chord angle
+    tree = spherely.SpatialIndex(geographies)
+    point = spherely.create_point(1, 1)
+    match = "radius must be a finite value greater than 0"
+    with pytest.raises(ValueError, match=match):
+        tree.query_nearest(point, radius=radius)
+    with pytest.raises(ValueError, match=match):
+        tree.query_nearest(point, max_distance=1000.0, radius=radius)
+    with pytest.raises(ValueError, match=match):
+        tree.query_nearest(np.array([point]), radius=radius)
+
+
+def test_query_nearest_exclusive() -> None:
+    tree = spherely.SpatialIndex(
+        [
+            spherely.create_point(0, 0),
+            spherely.create_point(-2, 0),
+            spherely.create_point(2, 0),
+        ]
+    )
+    query = spherely.create_point(0, 0)
+    np.testing.assert_array_equal(tree.query_nearest(query), [0])
+    result = tree.query_nearest(query, exclusive=True)
+    # the equal geography is skipped, the two symmetric neighbors are tied
+    np.testing.assert_array_equal(result, [1, 2])
+
+    # a non-equal geography at distance zero is still returned
+    query = spherely.create_point(1, 1)
+    poly = spherely.create_polygon([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)])
+    tree = spherely.SpatialIndex([spherely.create_point(1, 1), poly])
+    result, distances = tree.query_nearest(query, exclusive=True, return_distance=True)
+    np.testing.assert_array_equal(result, [1])
+    np.testing.assert_array_equal(distances, [0.0])
+
+
+def test_query_nearest_exclusive_all_equal() -> None:
+    # all geographies at distance zero are equal to the query
+    tree = spherely.SpatialIndex(
+        [spherely.create_point(1, 1), spherely.create_point(1, 1)]
+    )
+    query = spherely.create_point(1, 1)
+    result = tree.query_nearest(query, exclusive=True)
+    assert result.shape == (0,)
+
+    # with a farther non-equal geography, that one is returned
+    far = spherely.create_point(3, 3)
+    tree = spherely.SpatialIndex(
+        [spherely.create_point(1, 1), spherely.create_point(1, 1), far]
+    )
+    indices, distances = tree.query_nearest(query, exclusive=True, return_distance=True)
+    np.testing.assert_array_equal(indices, [2])
+    np.testing.assert_allclose(distances, spherely.distance(query, far))
+
+    # unless it is beyond max_distance
+    result = tree.query_nearest(query, exclusive=True, max_distance=1.0)
+    assert result.shape == (0,)
+
+
+def test_query_nearest_exclusive_all_equal_beyond_batch() -> None:
+    # more geographies equal to the query than the initial max_results batch
+    # of the fallback path (16), so the query has to be re-run with a larger
+    # batch until the first result at a distance > 0 shows up
+    query = spherely.create_point(1, 1)
+    equal = [spherely.create_point(1, 1) for _ in range(40)]
+    far = spherely.create_point(3, 3)
+    tree = spherely.SpatialIndex(equal + [far])
+
+    indices, distances = tree.query_nearest(query, exclusive=True, return_distance=True)
+    np.testing.assert_array_equal(indices, [len(equal)])
+    np.testing.assert_allclose(distances, spherely.distance(query, far))
+
+    # ... and with nothing else in the index, the loop still terminates
+    tree = spherely.SpatialIndex(equal)
+    assert tree.query_nearest(query, exclusive=True).shape == (0,)
+
+
+def test_query_nearest_against_distance_oracle() -> None:
+    rng = np.random.default_rng(42)
+    lon = rng.uniform(-180, 180, 20)
+    lat = rng.uniform(-90, 90, 20)
+    geographies = np.asarray(spherely.points(lon, lat))
+    tree = spherely.SpatialIndex(geographies)
+
+    for qlon, qlat in [(0, 0), (179.5, 0.5), (-179.5, -0.5), (0, 89.9), (0, -89.9)]:
+        query = spherely.create_point(qlon, qlat)
+        result = tree.query_nearest(query)
+        distances = np.asarray(spherely.distance(query, geographies))
+        expected = np.flatnonzero(distances == distances.min())
+        np.testing.assert_array_equal(result, expected)
